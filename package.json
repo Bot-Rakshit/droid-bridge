@@ -1,0 +1,30 @@
+{
+    "name": "droid-provider-bridge",
+    "version": "1.0.0",
+    "description": "Factory AI Droid plugin - Connect Antigravity (Claude/Gemini) and Codex (GPT Pro) subscriptions",
+    "type": "module",
+    "main": "dist/index.js",
+    "scripts": {
+        "start": "npx tsx src/index.ts",
+        "dev": "npx tsx watch src/index.ts",
+        "build": "tsc",
+        "add-account": "npx tsx src/cli/add-account.ts",
+        "setup-factory": "npx tsx src/cli/setup-factory.ts"
+    },
+    "keywords": [
+        "factory-ai",
+        "droid",
+        "antigravity",
+        "codex",
+        "claude",
+        "gemini",
+        "openai",
+        "proxy"
+    ],
+    "author": "",
+    "license": "MIT",
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "typescript": "^5.7.0"
+    }
+}
