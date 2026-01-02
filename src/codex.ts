@@ -2,10 +2,12 @@
  * Codex Provider
  * 
  * Handles ChatGPT Pro/Codex subscription authentication and API calls for:
- * - GPT-4.5
- * - GPT-5 Codex
+ * - GPT-5.2
+ * - GPT-5.2 Thinking
+ * - GPT-5.2 Codex
  * 
  * Authentication is done via session token from browser cookies.
+ * Uses the ChatGPT Responses API format.
  */
 
 import * as crypto from "node:crypto";
@@ -15,11 +17,12 @@ import type {
     ChatMessage,
     Tool,
     APIResponse,
+    ContentPart,
 } from "./types.js";
 import { upsertAccount } from "./storage.js";
 
 const CODEX_API_URL = "https://chatgpt.com/backend-api";
-const CODEX_CONVERSATION_URL = `${CODEX_API_URL}/conversation`;
+const CODEX_RESPONSES_URL = `${CODEX_API_URL}/responses`;
 
 /**
  * Instructions for getting ChatGPT session token.
@@ -69,7 +72,7 @@ export async function verifyCodexToken(
     const isProUser = data.plan_type === "plus" ||
         data.plan_type === "pro" ||
         (data.entitlement?.available_models ?? []).some(m =>
-            m.includes("gpt-4") || m.includes("gpt-5") || m.includes("codex")
+            m.includes("gpt-5") || m.includes("codex")
         );
 
     return {
@@ -125,26 +128,45 @@ export async function refreshCodexToken(account: ProviderAccount): Promise<Provi
 }
 
 /**
- * Convert messages to Codex format.
+ * Convert messages to Codex Responses API format.
  */
-function convertMessages(messages: ChatMessage[]): Array<{
-    id: string;
-    author: { role: string };
-    content: { content_type: string; parts: string[] };
-}> {
-    const result: Array<{
-        id: string;
-        author: { role: string };
-        content: { content_type: string; parts: string[] };
+function convertToResponsesFormat(
+    messages: ChatMessage[],
+    tools?: Tool[]
+): {
+    instructions: string | undefined;
+    input: Array<{
+        type: string;
+        role: string;
+        content: Array<{ type: string; text?: string }>;
+    }>;
+    tools: Array<{
+        type: string;
+        name: string;
+        description?: string;
+        parameters?: Record<string, unknown>;
+    }>;
+} {
+    let instructions: string | undefined;
+    const input: Array<{
+        type: string;
+        role: string;
+        content: Array<{ type: string; text?: string }>;
     }> = [];
 
     for (const msg of messages) {
-        if (msg.role === "system") continue; // System is handled separately
-        if (msg.role === "tool") continue; // Tool responses handled inline
+        if (msg.role === "system") {
+            // System messages become instructions
+            const text = typeof msg.content === "string"
+                ? msg.content
+                : (msg.content as ContentPart[])?.filter(p => p.type === "text").map(p => p.text).join("\n") || "";
+            instructions = instructions ? `${instructions}\n\n${text}` : text;
+            continue;
+        }
 
-        const role = msg.role === "assistant" ? "assistant" : "user";
+        if (msg.role === "tool") continue; // Handle tool responses inline
+
         let text = "";
-
         if (typeof msg.content === "string") {
             text = msg.content;
         } else if (Array.isArray(msg.content)) {
@@ -155,63 +177,56 @@ function convertMessages(messages: ChatMessage[]): Array<{
         }
 
         if (text) {
-            result.push({
-                id: crypto.randomUUID(),
-                author: { role },
-                content: { content_type: "text", parts: [text] },
+            input.push({
+                type: "message",
+                role: msg.role === "assistant" ? "assistant" : "user",
+                content: [{ type: "input_text", text }],
             });
         }
     }
 
-    return result;
+    // Convert tools
+    const convertedTools = (tools || [])
+        .filter(t => t.type === "function" && t.function)
+        .map(t => ({
+            type: "function",
+            name: t.function.name,
+            description: t.function.description,
+            parameters: t.function.parameters,
+        }));
+
+    return { instructions, input, tools: convertedTools };
 }
 
 /**
- * Get system message from messages.
- */
-function getSystemMessage(messages: ChatMessage[]): string | undefined {
-    const systemMsgs = messages.filter(m => m.role === "system");
-    if (systemMsgs.length === 0) return undefined;
-
-    return systemMsgs
-        .map(m => typeof m.content === "string" ? m.content : "")
-        .join("\n\n");
-}
-
-/**
- * Make a Codex API request.
+ * Make a Codex API request using Responses API.
  */
 export async function callCodex(
     account: ProviderAccount,
     model: ModelConfig,
     messages: ChatMessage[],
-    _tools?: Tool[],
+    tools?: Tool[],
     options?: { maxTokens?: number; temperature?: number; stream?: boolean }
 ): Promise<Response> {
     if (!account.sessionToken) {
         throw new Error("No session token available");
     }
 
-    const convertedMessages = convertMessages(messages);
-    const systemMessage = getSystemMessage(messages);
-
-    const parentMessageId = crypto.randomUUID();
+    const { instructions, input, tools: convertedTools } = convertToResponsesFormat(messages, tools);
 
     const request = {
-        action: "next",
-        messages: convertedMessages,
-        parent_message_id: parentMessageId,
         model: model.actualModel,
-        timezone_offset_min: new Date().getTimezoneOffset(),
-        suggestions: [],
-        history_and_training_disabled: true,
-        conversation_mode: { kind: "primary_assistant" },
-        force_paragen: false,
-        force_rate_limit: false,
-        system_hints: systemMessage ? [systemMessage] : undefined,
+        instructions,
+        input,
+        tools: convertedTools,
+        tool_choice: convertedTools.length > 0 ? "auto" : undefined,
+        store: false,
+        stream: options?.stream ?? true,
+        max_output_tokens: options?.maxTokens,
+        temperature: options?.temperature,
     };
 
-    return fetch(CODEX_CONVERSATION_URL, {
+    return fetch(CODEX_RESPONSES_URL, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
@@ -246,6 +261,7 @@ export async function* parseCodexStream(
 
     const decoder = new TextDecoder();
     let buffer = "";
+    let lastContent = "";
 
     while (true) {
         const { done, value } = await reader.read();
@@ -271,9 +287,39 @@ export async function* parseCodexStream(
 
             try {
                 const parsed = JSON.parse(data);
-                const content = parsed.message?.content?.parts?.[0];
 
-                if (content && typeof content === "string") {
+                // Handle different response formats
+                let content: string | undefined;
+
+                // Responses API format
+                if (parsed.output) {
+                    for (const item of parsed.output) {
+                        if (item.type === "message" && item.content) {
+                            for (const c of item.content) {
+                                if (c.type === "output_text" && c.text) {
+                                    // Only send the delta (new content)
+                                    const newContent = c.text.slice(lastContent.length);
+                                    if (newContent) {
+                                        content = newContent;
+                                        lastContent = c.text;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fallback to conversation format
+                if (!content && parsed.message?.content?.parts?.[0]) {
+                    const text = parsed.message.content.parts[0];
+                    const newContent = text.slice(lastContent.length);
+                    if (newContent) {
+                        content = newContent;
+                        lastContent = text;
+                    }
+                }
+
+                if (content) {
                     yield {
                         id: requestId,
                         object: "chat.completion.chunk",
@@ -307,9 +353,23 @@ export function parseCodexResponse(
 
         try {
             const parsed = JSON.parse(data);
-            const parts = parsed.message?.content?.parts;
-            if (parts?.[0]) {
-                content = parts[0];
+
+            // Responses API format
+            if (parsed.output) {
+                for (const item of parsed.output) {
+                    if (item.type === "message" && item.content) {
+                        for (const c of item.content) {
+                            if (c.type === "output_text" && c.text) {
+                                content = c.text;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback
+            if (!content && parsed.message?.content?.parts) {
+                content = parsed.message.content.parts[0] || "";
             }
         } catch {
             // Skip

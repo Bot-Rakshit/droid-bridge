@@ -291,7 +291,7 @@ function convertMessages(messages: ChatMessage[]): {
 /**
  * Convert tools to Antigravity format.
  */
-function convertTools(tools: Tool[] | undefined): Array<{ functionDeclarations: Array<Record<string, unknown>> }> | undefined {
+function convertTools(tools: Tool[] | undefined): Array<{ functionDeclarations: Array<{ name: string; description?: string; parameters?: Record<string, unknown> }> }> | undefined {
     if (!tools?.length) return undefined;
 
     const functionDeclarations = tools
